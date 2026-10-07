@@ -88,19 +88,25 @@ public final class UserTokenVerifier {
         ISSUER_MISMATCH
     }
 
-    /** 校验结果：成功带身份，失败带原因（两者恰有一个非空）。 */
-    public record Result(UserIdentity identity, Failure failure) {
+    /**
+     * 校验结果：成功带身份与令牌自身的过期时刻，失败带原因（两者恰有一个非空）。
+     *
+     * @param expEpochSeconds 成功时令牌的 {@code exp}（epoch 秒）：这条「通过」结论本身
+     *                        也只活到这一刻——结论缓存拿它当复用的硬上限
+     *                        （见 IdentityCheckCache），绝不允许越过；失败时无意义，置 0
+     */
+    public record Result(UserIdentity identity, Failure failure, long expEpochSeconds) {
 
         public boolean ok() {
             return identity != null;
         }
 
-        static Result ok(UserIdentity identity) {
-            return new Result(identity, null);
+        static Result ok(UserIdentity identity, long expEpochSeconds) {
+            return new Result(identity, null, expEpochSeconds);
         }
 
         static Result fail(Failure failure) {
-            return new Result(null, failure);
+            return new Result(null, failure, 0L);
         }
     }
 
@@ -187,7 +193,7 @@ public final class UserTokenVerifier {
             return Result.fail(Failure.EXPIRED);
         }
 
-        return Result.ok(new UserIdentity(userId, tenantId));
+        return Result.ok(new UserIdentity(userId, tenantId), exp);
     }
 
     private JsonNode decodeJson(String b64url) {

@@ -11,6 +11,7 @@ import com.apigw.proxy.match.RouteMatcher;
 import com.apigw.proxy.route.RouteCatalog;
 import com.apigw.proxy.userauth.UserAuthGatekeeper;
 import com.apigw.support.JwtMinter;
+import com.apigw.support.MutableClock;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import org.junit.jupiter.api.AfterEach;
@@ -26,8 +27,8 @@ import org.springframework.web.server.handler.FilteringWebHandler;
 import reactor.netty.DisposableServer;
 import reactor.netty.http.server.HttpServer;
 
-import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -54,6 +55,8 @@ class UserAuthProxyFilterTest {
     private InMemoryRouteStore store;
     private RouteCatalog catalog;
     private GatewayPassSigner passSigner;
+    /** 验签器与结论缓存共用的一面钟：测试里随拨随走，不靠 sleep 等过期。 */
+    private MutableClock clock;
 
     private DisposableServer server;
     private String baseUrl;
@@ -68,8 +71,9 @@ class UserAuthProxyFilterTest {
         catalog = new RouteCatalog(store, props);
 
         passSigner = new GatewayPassSigner(PASS_SECRET);
-        var verifier = new UserTokenVerifier(TOKEN_SECRET, null, Clock.systemUTC(), new ObjectMapper());
-        var gatekeeper = new UserAuthGatekeeper(verifier, passSigner);
+        clock = MutableClock.at(Instant.now());
+        var verifier = new UserTokenVerifier(TOKEN_SECRET, null, clock, new ObjectMapper());
+        var gatekeeper = new UserAuthGatekeeper(verifier, passSigner, clock);
 
         server = startServer(gatekeeper);
         baseUrl = "http://127.0.0.1:" + server.port();
@@ -129,7 +133,7 @@ class UserAuthProxyFilterTest {
     }
 
     private String validToken() {
-        return token(TOKEN_SECRET, "user-1", "tenant-a", System.currentTimeMillis() / 1000 + 3600);
+        return token(TOKEN_SECRET, "user-1", "tenant-a", clock.instant().getEpochSecond() + 3600);
     }
 
     // ---- 受保护路由：必须验过 ----
@@ -168,7 +172,7 @@ class UserAuthProxyFilterTest {
     void protectedRoute_tokenSignedWithWrongSecret_is401() {
         loadRoutes(route("secure", 1));
         String forged = token(WRONG_SECRET, "user-1", "tenant-a",
-                System.currentTimeMillis() / 1000 + 3600);
+                clock.instant().getEpochSecond() + 3600);
 
         var resp = client.get().uri(baseUrl + "/secure/1")
                 .header("Authorization", "Bearer " + forged)
@@ -181,7 +185,7 @@ class UserAuthProxyFilterTest {
     @Test
     void protectedRoute_expiredToken_is401_boundaryCountsAsExpired() {
         loadRoutes(route("secure", 1));
-        long now = System.currentTimeMillis() / 1000;
+        long now = clock.instant().getEpochSecond();
         // 已过期 10 秒
         var expired = client.get().uri(baseUrl + "/secure/1")
                 .header("Authorization", "Bearer " + token(TOKEN_SECRET, "user-1", "tenant-a", now - 10))
@@ -196,6 +200,54 @@ class UserAuthProxyFilterTest {
         assertThat(atBoundary.statusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
         atBoundary.releaseBody().block();
         assertThat(upstream.lastExchange()).isNull();
+    }
+
+    @Test
+    void cachedConclusion_diesAtExpiry_onBothRouteTypes() {
+        // 事故回放：令牌先验过（结论进缓存），过期之后缓存窗口还远没结束——
+        // 修复前两个入口都会把旧结论再认一阵；现在 exp 一到结论即废
+        loadRoutes(route("secure", 1), route("open", 0));
+        String token = token(TOKEN_SECRET, "user-1", "tenant-a",
+                clock.instant().getEpochSecond() + 30);
+
+        // 过期前：受保护路由放行并透传身份（结论暖进缓存）
+        var warmSecure = client.get().uri(baseUrl + "/secure/1")
+                .header("Authorization", "Bearer " + token).exchange().block();
+        assertThat(warmSecure.statusCode()).isEqualTo(HttpStatus.OK);
+        warmSecure.releaseBody().block();
+        assertThat(upstream.lastExchange().getRequestHeaders().getFirst("X-User-Id"))
+                .isEqualTo("user-1");
+
+        // 开放路由同一枚令牌也认（同一套缓存）
+        var warmOpen = client.get().uri(baseUrl + "/open/1")
+                .header("Authorization", "Bearer " + token).exchange().block();
+        assertThat(warmOpen.statusCode()).isEqualTo(HttpStatus.OK);
+        warmOpen.releaseBody().block();
+        assertThat(upstream.lastExchange().getRequestHeaders().getFirst("X-User-Id"))
+                .isEqualTo("user-1");
+
+        // 正好拨到过期那一刻（缓存窗口 60s 远未结束）：受保护路由必须立刻 401
+        clock.advanceSeconds(30);
+        var atBoundary = client.get().uri(baseUrl + "/secure/1")
+                .header("Authorization", "Bearer " + token).exchange().block();
+        assertThat(atBoundary.statusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        atBoundary.releaseBody().block();
+
+        // 过期之后：受保护路由照样拦，不打上游
+        clock.advanceSeconds(5);
+        var expiredSecure = client.get().uri(baseUrl + "/secure/1")
+                .header("Authorization", "Bearer " + token).exchange().block();
+        assertThat(expiredSecure.statusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        expiredSecure.releaseBody().block();
+
+        // 同一枚令牌同一时刻，开放路由同样不再认——放行但匿名，身份头一个都不许有
+        var expiredOpen = client.get().uri(baseUrl + "/open/1")
+                .header("Authorization", "Bearer " + token).exchange().block();
+        assertThat(expiredOpen.statusCode()).isEqualTo(HttpStatus.OK);
+        expiredOpen.releaseBody().block();
+        HttpExchange openGot = upstream.lastExchange();
+        assertThat(openGot.getRequestHeaders().get("X-User-Id")).isNullOrEmpty();
+        assertThat(openGot.getRequestHeaders().get("X-Tenant-Id")).isNullOrEmpty();
     }
 
     @Test
@@ -220,7 +272,7 @@ class UserAuthProxyFilterTest {
         String traceId = got.getRequestHeaders().getFirst("X-Gateway-Trace-Id");
         assertThat(pass).isNotBlank();
         assertThat(passSigner.verify(pass, traceId, "GET", "/secure/1", "user-1", "tenant-a",
-                System.currentTimeMillis(), 60_000)).isTrue();
+                clock.millis(), 60_000)).isTrue();
     }
 
     @Test
@@ -244,13 +296,13 @@ class UserAuthProxyFilterTest {
         assertThat(pass).isNotEqualTo("v1.0.forged");
         String traceId = got.getRequestHeaders().getFirst("X-Gateway-Trace-Id");
         assertThat(passSigner.verify(pass, traceId, "GET", "/secure/1", "user-1", "tenant-a",
-                System.currentTimeMillis(), 60_000)).isTrue();
+                clock.millis(), 60_000)).isTrue();
     }
 
     @Test
     void protectedRoute_butAuthNotConfigured_failsClosed503() {
         // 配了「需登录」却没配验签密钥：配置事故，fail-closed，绝不裸放行
-        var gatekeeper = new UserAuthGatekeeper(null, null);
+        var gatekeeper = new UserAuthGatekeeper(null, null, clock);
         DisposableServer noAuthServer = startServer(gatekeeper);
         try {
             loadRoutes(route("secure", 1));
@@ -290,7 +342,7 @@ class UserAuthProxyFilterTest {
         assertThat(pass).isNotBlank().isNotEqualTo("v1.0.forged");
         String traceId = got.getRequestHeaders().getFirst("X-Gateway-Trace-Id");
         assertThat(passSigner.verify(pass, traceId, "GET", "/open/1", "", "",
-                System.currentTimeMillis(), 60_000)).isTrue();
+                clock.millis(), 60_000)).isTrue();
     }
 
     @Test

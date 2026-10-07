@@ -6,6 +6,8 @@ import com.apigw.domain.userauth.UserIdentity;
 import com.apigw.domain.userauth.UserTokenVerifier;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 
+import java.time.Clock;
+
 /**
  * 用户登录鉴权的守门人：转发过滤器在匹配到路由之后，拿它做两件事——
  *
@@ -17,8 +19,10 @@ import org.springframework.http.server.reactive.ServerHttpRequest;
  * 2. <b>组装出站身份</b>：验出的身份 + 网关自盖的通行标记，打包成 {@link OutboundAuth}
  *    交给转发器写向上游。身份头只可能来自这里，调用方在入站塞的同名头转发器会先清掉。
  *
- * 验签结论会在各自入口做一层短缓存（见 {@link IdentityCheckCache}）：受保护路由与开放路由
- * 各有一套，免掉同一枚令牌在一次转发里被反复验签的开销。
+ * 验签结论有一层短缓存（见 {@link IdentityCheckCache}）：受保护路由与开放路由
+ * <b>共用同一套</b>——同一枚令牌在同一时刻，两个入口拿到的必然是同一个判定，
+ * 不存在「受保护这边拦了、开放那边还当有效身份透传」的缝。复用同时被令牌自身
+ * {@code exp} 卡死，永远越不过过期那一刻。
  *
  * 两个协作者都可为空（取决于 {@code apigw.user-auth.*} 是否配了密钥）：
  * 没配验签密钥时受保护路由 fail-closed（由过滤器判 503），开放路由不受影响。
@@ -27,28 +31,27 @@ public class UserAuthGatekeeper {
 
     private static final String BEARER_PREFIX = "Bearer ";
 
-    /** 受保护路由的验签结论缓存：一次转发里同一枚令牌只验一遍。 */
-    private static final long PROTECTED_CHECK_WINDOW_MILLIS = 60_000L;
-    /** 开放路由的身份补充缓存：开放路由不拦人，身份取用可以放得久一点。 */
-    private static final long OPEN_ROUTE_CHECK_WINDOW_MILLIS = 300_000L;
+    /**
+     * 验签结论的复用窗口（两个入口同一套、同一个窗口）：只是省重复验签的性能手段，
+     * 复用上限同时受令牌自身 {@code exp} 卡死（见 {@link IdentityCheckCache}）。
+     */
+    private static final long CHECK_WINDOW_MILLIS = 60_000L;
 
     private final UserTokenVerifier verifier;
     private final GatewayPassSigner passSigner;
-    private final IdentityCheckCache protectedChecks;
-    private final IdentityCheckCache openRouteChecks;
+    private final Clock clock;
+    private final IdentityCheckCache checks;
 
-    public UserAuthGatekeeper(UserTokenVerifier verifier, GatewayPassSigner passSigner) {
-        this(verifier, passSigner,
-                new IdentityCheckCache(PROTECTED_CHECK_WINDOW_MILLIS),
-                new IdentityCheckCache(OPEN_ROUTE_CHECK_WINDOW_MILLIS));
-    }
-
-    public UserAuthGatekeeper(UserTokenVerifier verifier, GatewayPassSigner passSigner,
-                              IdentityCheckCache protectedChecks, IdentityCheckCache openRouteChecks) {
+    /**
+     * @param clock 与验签器判 {@code exp}/{@code nbf} 同一面钟：缓存量「现在」也靠它，
+     *              两面钟会让复用窗口与令牌有效期各说各话
+     */
+    public UserAuthGatekeeper(UserTokenVerifier verifier, GatewayPassSigner passSigner, Clock clock) {
         this.verifier = verifier;
         this.passSigner = passSigner;
-        this.protectedChecks = protectedChecks;
-        this.openRouteChecks = openRouteChecks;
+        this.clock = clock;
+        // 缓存与验签器同生同灭：密钥轮换/停用 = 重建守门人，旧结论随旧实例整体作废
+        this.checks = new IdentityCheckCache(CHECK_WINDOW_MILLIS, clock);
     }
 
     /** 是否配了验签密钥（没配时受保护路由必须 fail-closed，不能裸放行）。 */
@@ -76,12 +79,13 @@ public class UserAuthGatekeeper {
 
     /** 真验签：签名、过期、必备声明逐项过（见 {@link UserTokenVerifier}）。 */
     public UserTokenVerifier.Result verify(String token) {
-        return protectedChecks.check(token, verifier::verify);
+        return checks.check(token, verifier::verify);
     }
 
     /**
      * 开放路由专用：带了令牌就试着验，验过给身份；没带或验不过一律当匿名（返回 null），
-     * 开放路由绝不因为令牌问题拦人。
+     * 开放路由绝不因为令牌问题拦人。与 {@link #verify} 走同一套结论缓存，
+     * 同一枚令牌同一时刻两边的判定必然一致。
      */
     public UserIdentity tryVerifyIdentity(ServerHttpRequest request) {
         if (verifier == null) {
@@ -91,7 +95,7 @@ public class UserAuthGatekeeper {
         if (token == null) {
             return null;
         }
-        UserTokenVerifier.Result result = openRouteChecks.check(token, verifier::verify);
+        UserTokenVerifier.Result result = checks.check(token, verifier::verify);
         return result.ok() ? result.identity() : null;
     }
 
@@ -104,7 +108,7 @@ public class UserAuthGatekeeper {
         if (passSigner != null) {
             String method = request.getMethod() == null ? "" : request.getMethod().name();
             String path = request.getPath().pathWithinApplication().value();
-            pass = passSigner.sign(System.currentTimeMillis(), traceId, method, path,
+            pass = passSigner.sign(clock.millis(), traceId, method, path,
                     identity == null ? "" : identity.userId(),
                     identity == null ? "" : identity.tenantId());
         }

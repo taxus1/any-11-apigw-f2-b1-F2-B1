@@ -45,6 +45,17 @@ class UserTokenVerifierTest {
     }
 
     @Test
+    void okResult_carriesTokenExp_asHardBoundForConclusionReuse() {
+        // 「通过」结论必须带上令牌自己的 exp：结论缓存拿它当复用的硬上限，
+        // 复用窗口再大也不许越过过期那一刻
+        long exp = NOW_EPOCH + 3600;
+        UserTokenVerifier.Result r = verifier.verify(
+                JwtMinter.mintHs256(SECRET, payload(exp, "user-1", "tenant-a")));
+        assertThat(r.ok()).isTrue();
+        assertThat(r.expEpochSeconds()).isEqualTo(exp);
+    }
+
+    @Test
     void forgedSignature_signedWithWrongSecret_isRejected() {
         // 攻击者不知道真密钥，拿自己的密钥签了一张「字段全对」的令牌
         String forged = JwtMinter.mintHs256(OTHER_SECRET, payload(NOW_EPOCH + 3600, "user-1", "tenant-a"));

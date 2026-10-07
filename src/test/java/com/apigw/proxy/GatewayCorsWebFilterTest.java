@@ -74,7 +74,7 @@ class GatewayCorsWebFilterTest {
                         new com.apigw.domain.userauth.UserTokenVerifier(
                                 "cors-test-token-secret-0123456789abcdef", null,
                                 java.time.Clock.systemUTC(), new ObjectMapper()),
-                        null));
+                        null, java.time.Clock.systemUTC()));
         var corsFilter = new GatewayCorsWebFilter(corsProps);
         WebHandler tail = exchange -> {
             exchange.getResponse().setStatusCode(HttpStatus.OK);

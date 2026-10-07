@@ -27,6 +27,9 @@ public class UserAuthConfig {
 
     @Bean
     UserAuthGatekeeper userAuthGatekeeper(UserAuthProperties properties, ObjectMapper objectMapper) {
+        // 验签器与守门人（结论缓存）共用同一面钟：判 exp/nbf 的「现在」和缓存量窗口的
+        // 「现在」必须一致，两面钟会让复用窗口与令牌有效期各说各话
+        Clock clock = Clock.systemUTC();
         UserTokenVerifier verifier = null;
         if (properties.tokenVerificationEnabled()) {
             if (properties.tokenSecret().length() < RECOMMENDED_SECRET_LENGTH) {
@@ -34,7 +37,7 @@ public class UserAuthConfig {
                         RECOMMENDED_SECRET_LENGTH);
             }
             verifier = new UserTokenVerifier(properties.tokenSecret(), properties.issuer(),
-                    Clock.systemUTC(), objectMapper);
+                    clock, objectMapper);
         } else {
             log.info("未配置 apigw.user-auth.token-secret：用户令牌鉴权未启用，"
                     + "开放路由照常转发，配了「需登录」的路由将 fail-closed 回 503");
@@ -44,6 +47,6 @@ public class UserAuthConfig {
         if (properties.passSigningEnabled()) {
             signer = new GatewayPassSigner(properties.effectivePassSecret());
         }
-        return new UserAuthGatekeeper(verifier, signer);
+        return new UserAuthGatekeeper(verifier, signer, clock);
     }
 }
