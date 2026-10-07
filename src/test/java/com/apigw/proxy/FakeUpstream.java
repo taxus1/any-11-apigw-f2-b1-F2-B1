@@ -50,6 +50,11 @@ class FakeUpstream implements AutoCloseable {
         return lastExchange.get();
     }
 
+    /** 直接操作最后一笔上游请求的持有槽（测试需要清空基线，只断言某笔请求之后有没有再打上游）。 */
+    AtomicReference<HttpExchange> lastExchangeRef() {
+        return lastExchange;
+    }
+
     void setResponseStatus(int status) {
         this.responseStatus = status;
     }

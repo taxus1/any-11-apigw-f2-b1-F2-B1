@@ -68,8 +68,10 @@ class UserAuthProxyFilterTest {
         catalog = new RouteCatalog(store, props);
 
         passSigner = new GatewayPassSigner(PASS_SECRET);
-        var verifier = new UserTokenVerifier(TOKEN_SECRET, null, Clock.systemUTC(), new ObjectMapper());
-        var gatekeeper = new UserAuthGatekeeper(verifier, passSigner);
+        // 验签器与结论缓存必须共用同一只钟
+        Clock authClock = Clock.systemUTC();
+        var verifier = new UserTokenVerifier(TOKEN_SECRET, null, authClock, new ObjectMapper());
+        var gatekeeper = new UserAuthGatekeeper(verifier, passSigner, authClock);
 
         server = startServer(gatekeeper);
         baseUrl = "http://127.0.0.1:" + server.port();
@@ -250,7 +252,7 @@ class UserAuthProxyFilterTest {
     @Test
     void protectedRoute_butAuthNotConfigured_failsClosed503() {
         // 配了「需登录」却没配验签密钥：配置事故，fail-closed，绝不裸放行
-        var gatekeeper = new UserAuthGatekeeper(null, null);
+        var gatekeeper = new UserAuthGatekeeper(null, null, Clock.systemUTC());
         DisposableServer noAuthServer = startServer(gatekeeper);
         try {
             loadRoutes(route("secure", 1));
@@ -324,6 +326,49 @@ class UserAuthProxyFilterTest {
         HttpExchange got = upstream.lastExchange();
         assertThat(got.getRequestHeaders().getFirst("X-User-Id")).isEqualTo("user-1");
         assertThat(got.getRequestHeaders().getFirst("X-Tenant-Id")).isEqualTo("tenant-a");
+        assertThat(got.getRequestHeaders().get("Authorization")).isNullOrEmpty();
+    }
+
+    @Test
+    void expiredToken_afterBeingAcceptedOnce_isRejectedEverywhere_notCarriedPastExpiry()
+            throws Exception {
+        // 事故回归：一枚令牌过期前被验过（结论进缓存），过期之后——
+        // 受保护路由必须 401，开放路由必须立刻改口为匿名（不得再把旧身份透给上游），
+        // 两个入口同一时刻口径一致。旧实现里结论缓存与 exp 脱钩，这里会一边放行/一边漏身份。
+        loadRoutes(route("open", 0), route("secure", 1));
+        // 3s 后过期：远小于旧实现受保护 60s / 开放 300s 的复用窗口，正是「窗口跨过过期点」
+        String dying = token(TOKEN_SECRET, "user-1", "tenant-a",
+                System.currentTimeMillis() / 1000 + 3);
+
+        // 过期前：两个入口都认（先在受保护入口把结论验热）
+        var before = client.get().uri(baseUrl + "/secure/1")
+                .header("Authorization", "Bearer " + dying)
+                .exchange().block();
+        assertThat(before.statusCode()).isEqualTo(HttpStatus.OK);
+        before.releaseBody().block();
+
+        // 等过 exp：从铸造算起留足整 3 秒再压过秒边界（铸造与校验之间有网络/调度耗时），
+        // 验签与缓存共用同一时钟，不依赖两边对齐
+        Thread.sleep(3_500);
+        // 清掉过期前那笔成功转发在上游留下的记录，下面只看过期之后有没有再打上游
+        upstream.lastExchangeRef().set(null);
+
+        var secureAfter = client.get().uri(baseUrl + "/secure/1")
+                .header("Authorization", "Bearer " + dying)
+                .exchange().block();
+        assertThat(secureAfter.statusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        secureAfter.releaseBody().block();
+        assertThat(upstream.lastExchange()).isNull();
+
+        var openAfter = client.get().uri(baseUrl + "/open/1")
+                .header("Authorization", "Bearer " + dying)
+                .exchange().block();
+        assertThat(openAfter.statusCode()).isEqualTo(HttpStatus.OK);
+        openAfter.releaseBody().block();
+        HttpExchange got = upstream.lastExchange();
+        // 开放路由不拦人，但旧身份一个字都不能再透给上游
+        assertThat(got.getRequestHeaders().get("X-User-Id")).isNullOrEmpty();
+        assertThat(got.getRequestHeaders().get("X-Tenant-Id")).isNullOrEmpty();
         assertThat(got.getRequestHeaders().get("Authorization")).isNullOrEmpty();
     }
 

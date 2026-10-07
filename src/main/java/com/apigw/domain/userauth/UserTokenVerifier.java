@@ -88,19 +88,19 @@ public final class UserTokenVerifier {
         ISSUER_MISMATCH
     }
 
-    /** 校验结果：成功带身份，失败带原因（两者恰有一个非空）。 */
-    public record Result(UserIdentity identity, Failure failure) {
+    /** 校验结果：成功带身份与令牌过期时刻，失败带原因（成功/失败恰有一种形态）。 */
+    public record Result(UserIdentity identity, Failure failure, Long expiryEpochSecond) {
 
         public boolean ok() {
             return identity != null;
         }
 
-        static Result ok(UserIdentity identity) {
-            return new Result(identity, null);
+        static Result ok(UserIdentity identity, long expiryEpochSecond) {
+            return new Result(identity, null, expiryEpochSecond);
         }
 
         static Result fail(Failure failure) {
-            return new Result(null, failure);
+            return new Result(null, failure, null);
         }
     }
 
@@ -187,7 +187,7 @@ public final class UserTokenVerifier {
             return Result.fail(Failure.EXPIRED);
         }
 
-        return Result.ok(new UserIdentity(userId, tenantId));
+        return Result.ok(new UserIdentity(userId, tenantId), exp);
     }
 
     private JsonNode decodeJson(String b64url) {

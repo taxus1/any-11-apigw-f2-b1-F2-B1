@@ -6,6 +6,8 @@ import com.apigw.domain.userauth.UserIdentity;
 import com.apigw.domain.userauth.UserTokenVerifier;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 
+import java.time.Clock;
+
 /**
  * 用户登录鉴权的守门人：转发过滤器在匹配到路由之后，拿它做两件事——
  *
@@ -17,8 +19,10 @@ import org.springframework.http.server.reactive.ServerHttpRequest;
  * 2. <b>组装出站身份</b>：验出的身份 + 网关自盖的通行标记，打包成 {@link OutboundAuth}
  *    交给转发器写向上游。身份头只可能来自这里，调用方在入站塞的同名头转发器会先清掉。
  *
- * 验签结论会在各自入口做一层短缓存（见 {@link IdentityCheckCache}）：受保护路由与开放路由
- * 各有一套，免掉同一枚令牌在一次转发里被反复验签的开销。
+ * 验签结论的短缓存只有<b>一套</b>（见 {@link IdentityCheckCache}）：受保护路由与开放路由
+ * 共用同一实例、同一窗口、同一只时钟，所以同一枚令牌在同一时刻两个入口的判定必然一致；
+ * 复用寿命被令牌自身的 {@code exp} 截断，且只缓存成功结论。两个入口的区别只剩
+ * 「验不过时拦不拦」——受保护路由 401，开放路由按匿名放行。
  *
  * 两个协作者都可为空（取决于 {@code apigw.user-auth.*} 是否配了密钥）：
  * 没配验签密钥时受保护路由 fail-closed（由过滤器判 503），开放路由不受影响。
@@ -27,28 +31,27 @@ public class UserAuthGatekeeper {
 
     private static final String BEARER_PREFIX = "Bearer ";
 
-    /** 受保护路由的验签结论缓存：一次转发里同一枚令牌只验一遍。 */
-    private static final long PROTECTED_CHECK_WINDOW_MILLIS = 60_000L;
-    /** 开放路由的身份补充缓存：开放路由不拦人，身份取用可以放得久一点。 */
-    private static final long OPEN_ROUTE_CHECK_WINDOW_MILLIS = 300_000L;
+    /**
+     * 验签结论的复用窗口：只是省重复 HMAC 的性能上限，实际复用寿命取它与令牌
+     * {@code exp} 的较早者，绝不会越过过期时刻。两个入口共用这一个值，不允许分叉。
+     */
+    private static final long CHECK_WINDOW_MILLIS = 60_000L;
 
     private final UserTokenVerifier verifier;
     private final GatewayPassSigner passSigner;
-    private final IdentityCheckCache protectedChecks;
-    private final IdentityCheckCache openRouteChecks;
+    private final IdentityCheckCache checks;
 
-    public UserAuthGatekeeper(UserTokenVerifier verifier, GatewayPassSigner passSigner) {
-        this(verifier, passSigner,
-                new IdentityCheckCache(PROTECTED_CHECK_WINDOW_MILLIS),
-                new IdentityCheckCache(OPEN_ROUTE_CHECK_WINDOW_MILLIS));
+    /** 生产装配用：按固定窗口与给定时钟（与验签器同一只 UTC 钟）建共享缓存。 */
+    public UserAuthGatekeeper(UserTokenVerifier verifier, GatewayPassSigner passSigner, Clock clock) {
+        this(verifier, passSigner, new IdentityCheckCache(CHECK_WINDOW_MILLIS, clock));
     }
 
+    /** 测试/定制装配用：缓存实例可从外部给定（例如固定窗口为 0 或可拨时钟）。 */
     public UserAuthGatekeeper(UserTokenVerifier verifier, GatewayPassSigner passSigner,
-                              IdentityCheckCache protectedChecks, IdentityCheckCache openRouteChecks) {
+                              IdentityCheckCache checks) {
         this.verifier = verifier;
         this.passSigner = passSigner;
-        this.protectedChecks = protectedChecks;
-        this.openRouteChecks = openRouteChecks;
+        this.checks = checks;
     }
 
     /** 是否配了验签密钥（没配时受保护路由必须 fail-closed，不能裸放行）。 */
@@ -74,14 +77,15 @@ public class UserAuthGatekeeper {
         return token.isEmpty() ? null : token;
     }
 
-    /** 真验签：签名、过期、必备声明逐项过（见 {@link UserTokenVerifier}）。 */
+    /** 真验签：签名、过期、nbf、必备声明逐项过（见 {@link UserTokenVerifier}）。 */
     public UserTokenVerifier.Result verify(String token) {
-        return protectedChecks.check(token, verifier::verify);
+        return checks.check(token, verifier::verify);
     }
 
     /**
      * 开放路由专用：带了令牌就试着验，验过给身份；没带或验不过一律当匿名（返回 null），
-     * 开放路由绝不因为令牌问题拦人。
+     * 开放路由绝不因为令牌问题拦人。判定本身与受保护路由走同一个缓存、同一口径，
+     * 只是处理结论的方式不同。
      */
     public UserIdentity tryVerifyIdentity(ServerHttpRequest request) {
         if (verifier == null) {
@@ -91,7 +95,7 @@ public class UserAuthGatekeeper {
         if (token == null) {
             return null;
         }
-        UserTokenVerifier.Result result = openRouteChecks.check(token, verifier::verify);
+        UserTokenVerifier.Result result = checks.check(token, verifier::verify);
         return result.ok() ? result.identity() : null;
     }
 

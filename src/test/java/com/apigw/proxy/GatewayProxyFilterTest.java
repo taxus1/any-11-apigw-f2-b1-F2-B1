@@ -77,7 +77,7 @@ class GatewayProxyFilterTest {
                 catalog, new RouteMatcher(), new UpstreamForwarder(webClient),
                 new AccessLogRecorder(), e -> recordedEntries.add(e), new ObjectMapper(),
                 // 本测试不涉用户令牌：装一个「未启用」的守门人，验证老链路行为零变化
-                new com.apigw.proxy.userauth.UserAuthGatekeeper(null, null));
+                new com.apigw.proxy.userauth.UserAuthGatekeeper(null, null, java.time.Clock.systemUTC()));
 
         // 链尾 WebHandler：到这里的只有被判定为非转发流量（/api），回一个占位 200
         WebHandler tail = exchange -> {
