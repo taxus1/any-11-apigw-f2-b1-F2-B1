@@ -17,6 +17,9 @@ import org.springframework.http.server.reactive.ServerHttpRequest;
  * 2. <b>组装出站身份</b>：验出的身份 + 网关自盖的通行标记，打包成 {@link OutboundAuth}
  *    交给转发器写向上游。身份头只可能来自这里，调用方在入站塞的同名头转发器会先清掉。
  *
+ * 验签结论会在各自入口做一层短缓存（见 {@link IdentityCheckCache}）：受保护路由与开放路由
+ * 各有一套，免掉同一枚令牌在一次转发里被反复验签的开销。
+ *
  * 两个协作者都可为空（取决于 {@code apigw.user-auth.*} 是否配了密钥）：
  * 没配验签密钥时受保护路由 fail-closed（由过滤器判 503），开放路由不受影响。
  */
@@ -24,12 +27,28 @@ public class UserAuthGatekeeper {
 
     private static final String BEARER_PREFIX = "Bearer ";
 
+    /** 受保护路由的验签结论缓存：一次转发里同一枚令牌只验一遍。 */
+    private static final long PROTECTED_CHECK_WINDOW_MILLIS = 60_000L;
+    /** 开放路由的身份补充缓存：开放路由不拦人，身份取用可以放得久一点。 */
+    private static final long OPEN_ROUTE_CHECK_WINDOW_MILLIS = 300_000L;
+
     private final UserTokenVerifier verifier;
     private final GatewayPassSigner passSigner;
+    private final IdentityCheckCache protectedChecks;
+    private final IdentityCheckCache openRouteChecks;
 
     public UserAuthGatekeeper(UserTokenVerifier verifier, GatewayPassSigner passSigner) {
+        this(verifier, passSigner,
+                new IdentityCheckCache(PROTECTED_CHECK_WINDOW_MILLIS),
+                new IdentityCheckCache(OPEN_ROUTE_CHECK_WINDOW_MILLIS));
+    }
+
+    public UserAuthGatekeeper(UserTokenVerifier verifier, GatewayPassSigner passSigner,
+                              IdentityCheckCache protectedChecks, IdentityCheckCache openRouteChecks) {
         this.verifier = verifier;
         this.passSigner = passSigner;
+        this.protectedChecks = protectedChecks;
+        this.openRouteChecks = openRouteChecks;
     }
 
     /** 是否配了验签密钥（没配时受保护路由必须 fail-closed，不能裸放行）。 */
@@ -57,7 +76,7 @@ public class UserAuthGatekeeper {
 
     /** 真验签：签名、过期、必备声明逐项过（见 {@link UserTokenVerifier}）。 */
     public UserTokenVerifier.Result verify(String token) {
-        return verifier.verify(token);
+        return protectedChecks.check(token, verifier::verify);
     }
 
     /**
@@ -72,7 +91,7 @@ public class UserAuthGatekeeper {
         if (token == null) {
             return null;
         }
-        UserTokenVerifier.Result result = verifier.verify(token);
+        UserTokenVerifier.Result result = openRouteChecks.check(token, verifier::verify);
         return result.ok() ? result.identity() : null;
     }
 
